@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: whatsapp-bot-server
+    env: node
+    plan: free
+    buildCommand: |
+      apt-get update && apt-get install -y \
+        wget \
+        gnupg \
+        ca-certificates \
+        fonts-liberation \
+        libappindicator3-1 \
+        libasound2t64 \
+        libatk-bridge2.0-0t64 \
+        libatk1.0-0t64 \
+        libcups2t64 \
+        libdrm2 \
+        libgbm1 \
+        libnspr4 \
+        libnss3 \
+        libx11-xcb1 \
+        libxcomposite1 \
+        libxdamage1 \
+        libxrandr2 \
+        libxshmfence1 \
+        libxss1 \
+        lsb-release \
+        xdg-utils
+      yarn install
+    startCommand: node index.js
