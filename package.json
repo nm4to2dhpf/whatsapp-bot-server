@@ -1,0 +1,49 @@
+{
+  "components": {
+    "frontend": "Vite + React (client)",
+    "supabase": "Supabase (Postgres, Realtime, Storage, Edge Functions)",
+    "render": "Render service (Node + whatsapp-web.js)",
+    "whatsapp": "WhatsApp (mobile/wa servers)"
+  },
+  "flows": [
+    {
+      "name": "Frontend -> Supabase (user send message)",
+      "steps": [
+        "User compone messaggio e invia dal frontend.",
+        "Frontend scrive messages (status='pending') in Supabase via Edge Function or direct insert.",
+        "Supabase Realtime notifica admin UI (moderation panel)."
+      ]
+    },
+    {
+      "name": "Admin moderation -> approve",
+      "steps": [
+        "Admin vede pending message nella moderation UI.",
+        "Admin modifica/approva -> messages.status = 'approved'.",
+        "Render dispatch loop legge approved messages e le invia via whatsapp-web.js."
+      ]
+    },
+    {
+      "name": "WhatsApp incoming -> Render -> Supabase",
+      "steps": [
+        "WhatsApp message ricevuto da whatsapp-web.js in Render.",
+        "Render salva message su Supabase (status='received'), salva media su Storage.",
+        "Frontend (chat viewer) riceve aggiornamento via Realtime."
+      ]
+    },
+    {
+      "name": "WhatsApp status & QR",
+      "steps": [
+        "Eventi client (qr, ready, disconnected) aggiornano whatsapp_status table via RPC.",
+        "Frontend admin sottoscrive whatsapp_status via Realtime per mostrare QR o stato connesso."
+      ]
+    },
+    {
+      "name": "Error handling / offline",
+      "steps": [
+        "Se Supabase non raggiungibile, Render mette eventi in local queue (local_queue.json).",
+        "Flush loop riprova a sincronizzare quando possibile.",
+        "Logs e audit vengono salvati su supabase quando possibile."
+      ]
+    }
+  ]
+}
