@@ -67,15 +67,16 @@ function audit(action, meta = {}) {
   // best-effort: insert audit record to supabase, if fails, write to local queue
   (async () => {
     try {
-      await supabase.from("audit_log").insert([{ actor: INSTANCE_ID, action, meta }]);
+      const { error } = await supabase.from("audit_log").insert([{ actor: INSTANCE_ID, action, meta }]);
+      if (error) throw error;
     } catch (err) {
-      console.error("Audit insert failed, queueing locally:", err.message);
+      console.error("Audit insert failed, queueing locally:", err.message || err);
       enqueueLocal({ type: "audit", payload: { actor: INSTANCE_ID, action, meta } });
     }
   })();
 }
 
-// helper normalize numbers -> only digits, remove leading zeros if needed
+// helper normalize numbers -> only digits
 function normalizeNumber(raw) {
   if (!raw) return null;
   const digits = raw.replace(/\D/g, "");
@@ -128,15 +129,18 @@ client.on("qr", async (qr) => {
     latestQrDataUrl = await QRCode.toDataURL(qr);
     lastQrAt = new Date();
     console.log("QR GENERATO (base64).");
-    // write status to DB
-    await supabase.rpc("set_whatsapp_status", {
-      p_status: "qr_generated",
-      p_client_info: null,
-      p_qr: latestQrDataUrl
-    }).catch(err => {
+    // write status to DB via RPC (best-effort)
+    try {
+      const { error } = await supabase.rpc("set_whatsapp_status", {
+        p_status: "qr_generated",
+        p_client_info: null,
+        p_qr: latestQrDataUrl
+      });
+      if (error) throw error;
+    } catch (err) {
       console.warn("set_whatsapp_status rpc failed:", err.message || err);
       enqueueLocal({ type: "status", payload: { status: "qr_generated", qr: latestQrDataUrl } });
-    });
+    }
     audit("qr_generated", { instance: INSTANCE_ID });
   } catch (err) {
     console.error("Errore QR:", err.message || err);
@@ -147,11 +151,12 @@ client.on("ready", async () => {
   clientReady = true;
   console.log("WHATSAPP READY -> connected");
   try {
-    await supabase.rpc("set_whatsapp_status", {
+    const { error } = await supabase.rpc("set_whatsapp_status", {
       p_status: "connected",
       p_client_info: JSON.stringify({ instance: INSTANCE_ID }),
       p_qr: null
     });
+    if (error) throw error;
   } catch (err) {
     console.warn("Failed to update status on ready:", err.message || err);
     enqueueLocal({ type: "status", payload: { status: "connected" } });
@@ -163,11 +168,12 @@ client.on("disconnected", async (reason) => {
   clientReady = false;
   console.warn("WHATSAPP DISCONNECTED:", reason);
   try {
-    await supabase.rpc("set_whatsapp_status", {
+    const { error } = await supabase.rpc("set_whatsapp_status", {
       p_status: "disconnected",
       p_client_info: JSON.stringify({ instance: INSTANCE_ID, reason }),
       p_qr: null
     });
+    if (error) throw error;
   } catch (err) {
     enqueueLocal({ type: "status", payload: { status: "disconnected", reason } });
   }
@@ -178,11 +184,12 @@ client.on("auth_failure", async (msg) => {
   clientReady = false;
   console.error("AUTH FAILURE:", msg);
   try {
-    await supabase.rpc("set_whatsapp_status", {
+    const { error } = await supabase.rpc("set_whatsapp_status", {
       p_status: "auth_needed",
       p_client_info: JSON.stringify({ instance: INSTANCE_ID, msg }),
       p_qr: null
     });
+    if (error) throw error;
   } catch (err) {
     enqueueLocal({ type: "status", payload: { status: "auth_needed", msg } });
   }
@@ -212,18 +219,19 @@ client.on("message", async (msg) => {
       if (found && found.length) {
         chatId = found[0].id;
         // update last_message_at
-        await supabase.from("chats").update({ last_message_at: new Date() }).eq("id", chatId);
+        const { error: uerr } = await supabase.from("chats").update({ last_message_at: new Date() }).eq("id", chatId);
+        if (uerr) console.warn("Unable to update last_message_at:", uerr.message || uerr);
       } else {
-        const insert = await supabase.from("chats").insert([{
+        const { data: insertData, error: insertErr } = await supabase.from("chats").insert([{
           numero_normalized: normalized,
           jid,
           nome: null,
           cognome: null,
           status: "inactive",
           last_message_at: new Date()
-        }]).select("id").single();
-        if (insert.error) throw insert.error;
-        chatId = insert.data.id;
+        }]).select("id");
+        if (insertErr) throw insertErr;
+        chatId = Array.isArray(insertData) ? insertData[0].id : insertData.id;
       }
     } catch (err) {
       console.warn("Error upserting chat to supabase:", err.message || err);
@@ -241,17 +249,17 @@ client.on("message", async (msg) => {
           const buffer = Buffer.from(media.data, "base64");
           const ext = media.mimetype ? media.mimetype.split("/")[1] : "bin";
           const filename = `msg_media/${chatId}_${Date.now()}.${ext}`;
-          const uploadRes = await supabase.storage.from(SUPABASE_STORAGE_BUCKET).upload(filename, buffer, {
+          const { error: uploadErr } = await supabase.storage.from(SUPABASE_STORAGE_BUCKET).upload(filename, buffer, {
             contentType: media.mimetype
           });
 
-          if (uploadRes.error) {
-            console.warn("Storage upload failed:", uploadRes.error.message);
+          if (uploadErr) {
+            console.warn("Storage upload failed:", uploadErr.message || uploadErr);
             // fallback: enqueue media for later
             enqueueLocal({ type: "media_upload", payload: { filename, buffer: buffer.toString("base64"), contentType: media.mimetype }});
           } else {
-            const publicUrl = supabase.storage.from(SUPABASE_STORAGE_BUCKET).getPublicUrl(filename).data.publicUrl;
-            media_url = publicUrl;
+            const { data: publicData } = supabase.storage.from(SUPABASE_STORAGE_BUCKET).getPublicUrl(filename);
+            media_url = publicData?.publicUrl || null;
           }
         }
       }
@@ -260,7 +268,7 @@ client.on("message", async (msg) => {
     }
 
     // insert message record
-    const insertMsg = await supabase.from("messages").insert([{
+    const { data: inserted, error: insertMsgErr } = await supabase.from("messages").insert([{
       chat_id: chatId,
       sender: "whatsapp",
       numero: normalized,
@@ -269,8 +277,8 @@ client.on("message", async (msg) => {
       status: "received",
       whatsapp_message_id: msg.id?.id
     }]);
-    if (insertMsg.error) {
-      console.warn("Insert message failed, queue locally:", insertMsg.error.message);
+    if (insertMsgErr) {
+      console.warn("Insert message failed, queue locally:", insertMsgErr.message || insertMsgErr);
       enqueueLocal({ type: "incoming_msg", payload: { from: jid, body: msg.body, media_url, whatsapp_message_id: msg.id?.id }});
     } else {
       audit("message_received", { chat_id: chatId, whatsapp_id: msg.id?.id });
@@ -308,8 +316,7 @@ async function dispatchLoop() {
           .from("messages")
           .update({ in_progress: true })
           .match({ id: msg.id, in_progress: false, status: "approved" })
-          .select()
-          .limit(1);
+          .select();
 
         if (claimErr) {
           console.warn("Claim error:", claimErr.message || claimErr);
@@ -333,23 +340,22 @@ async function dispatchLoop() {
           if (msg.media_url) {
             // download file
             const fileRes = await fetch(msg.media_url);
+            if (!fileRes.ok) throw new Error(`Failed download media: ${fileRes.status}`);
             const arrayBuffer = await fileRes.arrayBuffer();
             const buffer = Buffer.from(arrayBuffer);
-            // whatsapp-web.js accept MessageMedia object or file buffer via sendMessage with Media
-            // we will use client.sendMessage(jid, buffer, { sendMediaAsDocument: false })
-            // BUT whatsapp-web.js expects MessageMedia; construct
             const mime = fileRes.headers.get("content-type") || "application/octet-stream";
-            // Use MessageMedia class
             const { MessageMedia } = await import("whatsapp-web.js");
             const base64 = buffer.toString("base64");
             const media = new MessageMedia(mime, base64);
             const sendRes = await client.sendMessage(jid || msg.chat_id, media, { caption: msg.message || "" });
             // update DB
-            await supabase.from("messages").update({ status: "sent", whatsapp_message_id: sendRes.id?.id || null, in_progress: false }).eq("id", msg.id);
+            const { error: updErr } = await supabase.from("messages").update({ status: "sent", whatsapp_message_id: sendRes.id?.id || null, in_progress: false }).eq("id", msg.id);
+            if (updErr) throw updErr;
             audit("message_sent", { id: msg.id, whatsapp_id: sendRes.id?.id });
           } else {
             const sendRes = await client.sendMessage(jid || msg.chat_id, msg.message || "");
-            await supabase.from("messages").update({ status: "sent", whatsapp_message_id: sendRes.id?.id, in_progress: false }).eq("id", msg.id);
+            const { error: updErr } = await supabase.from("messages").update({ status: "sent", whatsapp_message_id: sendRes.id?.id, in_progress: false }).eq("id", msg.id);
+            if (updErr) throw updErr;
             audit("message_sent", { id: msg.id, whatsapp_id: sendRes.id?.id });
           }
         } catch (sendErr) {
@@ -357,7 +363,8 @@ async function dispatchLoop() {
           // increment attempt_count, set in_progress false; maybe set status failed after many attempts
           const newAttempts = (msg.attempt_count || 0) + 1;
           const newStatus = (newAttempts >= 5) ? "failed" : "approved";
-          await supabase.from("messages").update({ attempt_count: newAttempts, in_progress: false, status: newStatus }).eq("id", msg.id);
+          const { error: incErr } = await supabase.from("messages").update({ attempt_count: newAttempts, in_progress: false, status: newStatus }).eq("id", msg.id);
+          if (incErr) console.warn("Failed to update attempt_count:", incErr.message || incErr);
           audit("send_failed", { id: msg.id, error: sendErr.message || sendErr });
         }
       }
@@ -384,9 +391,10 @@ async function flushLocalQueueLoop() {
       try {
         if (item.type === "audit") {
           const { actor, action, meta } = item.payload;
-          await supabase.from("audit_log").insert([{ actor, action, meta }]);
+          const { error } = await supabase.from("audit_log").insert([{ actor, action, meta }]);
+          if (error) throw error;
         } else if (item.type === "incoming_msg") {
-          await supabase.from("messages").insert([{
+          const { error } = await supabase.from("messages").insert([{
             chat_id: item.payload.chat_id || null,
             sender: "whatsapp",
             numero: item.payload.from || null,
@@ -395,13 +403,16 @@ async function flushLocalQueueLoop() {
             status: "received",
             whatsapp_message_id: item.payload.whatsapp_message_id || null
           }]);
+          if (error) throw error;
         } else if (item.type === "status") {
           const p = item.payload;
-          await supabase.rpc("set_whatsapp_status", { p_status: p.status || "disconnected", p_client_info: JSON.stringify(p.client_info || {}), p_qr: p.qr || null });
+          const { error } = await supabase.rpc("set_whatsapp_status", { p_status: p.status || "disconnected", p_client_info: JSON.stringify(p.client_info || {}), p_qr: p.qr || null });
+          if (error) throw error;
         } else if (item.type === "media_upload") {
           const filename = item.payload.filename;
           const buffer = Buffer.from(item.payload.buffer, "base64");
-          await supabase.storage.from(SUPABASE_STORAGE_BUCKET).upload(filename, buffer, { contentType: item.payload.contentType });
+          const { error } = await supabase.storage.from(SUPABASE_STORAGE_BUCKET).upload(filename, buffer, { contentType: item.payload.contentType });
+          if (error) throw error;
         }
         // if succeeded, remove from localQueue
         localQueue = localQueue.filter(x => x !== item);
@@ -422,7 +433,7 @@ app.get("/health", (req, res) => {
 
 app.get("/status", async (req, res) => {
   try {
-    const { data } = await supabase.from("whatsapp_status").select("*").limit(1).single();
+    const { data } = await supabase.from("whatsapp_status").select("*").limit(1).maybeSingle();
     res.json({ clientReady, status: data?.status || (clientReady ? "connected" : "disconnected"), whatsapp_status: data || null });
   } catch (err) {
     res.json({ clientReady, status: clientReady ? "connected" : "disconnected", error: err.message || err});
@@ -447,7 +458,7 @@ app.post("/send", async (req, res) => {
   if (!to && !chat_id) return res.status(400).json({ error: "Missing 'to' or 'chat_id' "});
   try {
     const numero = to ? normalizeNumber(to) : null;
-    const insert = await supabase.from("messages").insert([{
+    const { data: insertData, error } = await supabase.from("messages").insert([{
       chat_id,
       sender: "admin",
       numero,
@@ -456,8 +467,9 @@ app.post("/send", async (req, res) => {
       nome,
       cognome
     }]);
-    if (insert.error) throw insert.error;
-    res.json({ success: true, message: "Queued for send", id: insert.data[0].id });
+    if (error) throw error;
+    const id = Array.isArray(insertData) ? insertData[0].id : insertData.id;
+    res.json({ success: true, message: "Queued for send", id });
   } catch (err) {
     res.status(500).json({ error: err.message || err });
   }
