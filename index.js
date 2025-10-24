@@ -13,9 +13,14 @@ import { createClient } from "@supabase/supabase-js";
 dotenv.config();
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const SUPABASE_URL =
+  process.env.SUPABASE_URL ||
+  process.env.VITE_SUPABASE_URL ||
+  "https://mwpskchcxhjrhqvrrgpj.supabase.co";
+const SUPABASE_SERVICE_ROLE_KEY =
+  process.env.SUPABASE_SERVICE_ROLE_KEY ||
+  process.env.VITE_SUPABASE_PUBLISHABLE_KEY ||
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im13cHNrY2hjeGhqcmhxdnJyZ3BqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjEyNTc2ODQsImV4cCI6MjA3NjgzMzY4NH0.VB0rj4SER2W5EOpxnI06Bx-U7D5KlHIFNBJ93AzU9I8";
 const SUPABASE_STORAGE_BUCKET = process.env.SUPABASE_STORAGE_BUCKET || "whatsapp-media";
 const SESSION_PATH = process.env.SESSION_PATH || "./session";
 const INSTANCE_ID = process.env.INSTANCE_ID || `instance-${Math.random().toString(36).slice(2,8)}`;
