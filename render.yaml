@@ -28,3 +28,10 @@ services:
         xdg-utils
       yarn install
     startCommand: node index.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
