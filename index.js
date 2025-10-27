@@ -12,6 +12,7 @@ import { createClient } from "@supabase/supabase-js";
 
 dotenv.config();
 
+// ---- Config / constants
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SUPABASE_URL =
   process.env.SUPABASE_URL ||
@@ -34,55 +35,59 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: { persistSession: false }
 });
 
+// ---- Express init
 const app = express();
 app.use(express.json());
 
+// ---- State
 let clientReady = false;
 let latestQrDataUrl = null;
 let lastQrAt = null;
 let localQueueFile = path.join(__dirname, "local_queue.json");
 let localQueue = []; // array of {type, payload, created_at}
 
-// load local queue from disk if exists
+// ---- Load local queue if present
 try {
   if (fs.existsSync(localQueueFile)) {
     const raw = fs.readFileSync(localQueueFile, "utf8");
     localQueue = JSON.parse(raw || "[]");
-    console.log("Loaded local queue:", localQueue.length);
+    console.log(`[STARTUP] 📥 Loaded local queue: ${localQueue.length} items`);
+  } else {
+    console.log("[STARTUP] 📥 No local queue file found, starting fresh");
   }
 } catch (err) {
-  console.warn("Could not load local queue file:", err.message);
+  console.warn("[STARTUP] Could not load local queue file:", err.message || err);
 }
 
-// utility: persist local queue
+// ---- Utilities for local queue persistence
 function persistLocalQueue() {
   try {
     fs.writeFileSync(localQueueFile, JSON.stringify(localQueue, null, 2));
   } catch (err) {
-    console.error("Error persisting local queue:", err.message);
+    console.error("[QUEUE] Error persisting local queue:", err.message || err);
   }
 }
-
 function enqueueLocal(item) {
   localQueue.push({ ...item, created_at: new Date().toISOString() });
   persistLocalQueue();
+  console.log("[QUEUE] ➕ Enqueued local item:", item.type);
 }
 
-// logging helper
+// ---- Audit helper (best-effort)
 function audit(action, meta = {}) {
-  // best-effort: insert audit record to supabase, if fails, write to local queue
   (async () => {
     try {
       const { error } = await supabase.from("audit_log").insert([{ actor: INSTANCE_ID, action, meta }]);
       if (error) throw error;
+      console.log(`[AUDIT] ✔️ Logged action '${action}'`);
     } catch (err) {
-      console.error("Audit insert failed, queueing locally:", err.message || err);
+      console.error("[AUDIT] insert failed, queueing locally:", err.message || err);
       enqueueLocal({ type: "audit", payload: { actor: INSTANCE_ID, action, meta } });
     }
   })();
 }
 
-// helper normalize numbers -> only digits
+// ---- Helpers
 function normalizeNumber(raw) {
   if (!raw) return null;
   const digits = raw.replace(/\D/g, "");
@@ -94,8 +99,6 @@ function toJid(num) {
   if (num.includes("@")) return num;
   return `${num}@c.us`;
 }
-
-// Backoff helper
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
@@ -108,13 +111,13 @@ async function exponentialBackoff(fn, attempts = 5, base = 500) {
       i++;
       if (i >= attempts) throw err;
       const wait = base * Math.pow(2, i - 1);
-      console.warn(`Retry ${i}/${attempts} after ${wait}ms due to error:`, err.message || err);
+      console.warn(`[BACKOFF] Retry ${i}/${attempts} after ${wait}ms due to error:`, err.message || err);
       await sleep(wait);
     }
   }
 }
 
-// whatsapp-web.js client
+// ---- WhatsApp client
 const client = new Client({
   authStrategy: new LocalAuth({ clientId: "session-whatsapp", dataPath: SESSION_PATH }),
   puppeteer: {
@@ -130,11 +133,13 @@ const client = new Client({
   },
 });
 
+// ---- Events: qr, ready, disconnected, auth_failure
 client.on("qr", async (qr) => {
   try {
     latestQrDataUrl = await QRCode.toDataURL(qr);
     lastQrAt = new Date();
-    console.log("QR GENERATO (base64).");
+    console.log("\n[QR] ✅ QR CODE GENERATO!");
+    console.log("[QR] timestamp:", lastQrAt.toISOString());
     // write status to DB via RPC (best-effort)
     try {
       const { error } = await supabase.rpc("set_whatsapp_status", {
@@ -143,19 +148,20 @@ client.on("qr", async (qr) => {
         p_qr: latestQrDataUrl
       });
       if (error) throw error;
+      console.log("[DB] set_whatsapp_status -> qr_generated");
     } catch (err) {
-      console.warn("set_whatsapp_status rpc failed:", err.message || err);
+      console.warn("[DB] set_whatsapp_status rpc failed:", err.message || err);
       enqueueLocal({ type: "status", payload: { status: "qr_generated", qr: latestQrDataUrl } });
     }
     audit("qr_generated", { instance: INSTANCE_ID });
   } catch (err) {
-    console.error("Errore QR:", err.message || err);
+    console.error("[QR] Errore QR:", err.message || err);
   }
 });
 
 client.on("ready", async () => {
   clientReady = true;
-  console.log("WHATSAPP READY -> connected");
+  console.log("\n[CLIENT] ✅ WHATSAPP READY -> connected");
   try {
     const { error } = await supabase.rpc("set_whatsapp_status", {
       p_status: "connected",
@@ -163,8 +169,9 @@ client.on("ready", async () => {
       p_qr: null
     });
     if (error) throw error;
+    console.log("[DB] set_whatsapp_status -> connected");
   } catch (err) {
-    console.warn("Failed to update status on ready:", err.message || err);
+    console.warn("[DB] Failed to update status on ready:", err.message || err);
     enqueueLocal({ type: "status", payload: { status: "connected" } });
   }
   audit("client_ready", { instance: INSTANCE_ID });
@@ -172,7 +179,7 @@ client.on("ready", async () => {
 
 client.on("disconnected", async (reason) => {
   clientReady = false;
-  console.warn("WHATSAPP DISCONNECTED:", reason);
+  console.warn("\n[CLIENT] ⚠️ DISCONNESSO:", reason);
   try {
     const { error } = await supabase.rpc("set_whatsapp_status", {
       p_status: "disconnected",
@@ -180,6 +187,7 @@ client.on("disconnected", async (reason) => {
       p_qr: null
     });
     if (error) throw error;
+    console.log("[DB] set_whatsapp_status -> disconnected");
   } catch (err) {
     enqueueLocal({ type: "status", payload: { status: "disconnected", reason } });
   }
@@ -188,7 +196,7 @@ client.on("disconnected", async (reason) => {
 
 client.on("auth_failure", async (msg) => {
   clientReady = false;
-  console.error("AUTH FAILURE:", msg);
+  console.error("\n[AUTH] ❌ AUTH FAILURE:", msg);
   try {
     const { error } = await supabase.rpc("set_whatsapp_status", {
       p_status: "auth_needed",
@@ -196,25 +204,25 @@ client.on("auth_failure", async (msg) => {
       p_qr: null
     });
     if (error) throw error;
+    console.log("[DB] set_whatsapp_status -> auth_needed");
   } catch (err) {
     enqueueLocal({ type: "status", payload: { status: "auth_needed", msg } });
   }
   audit("auth_failure", { msg });
 });
 
-// message handler (incoming from WhatsApp)
+// ---- Message handler (incoming)
 client.on("message", async (msg) => {
-  console.log("Incoming message", msg.id?.id, msg.from, msg.body?.slice(0,100));
+  console.log("[MSG] Incoming", msg.id?.id, msg.from, msg.body?.slice(0,100));
   try {
     const from = msg.from; // jid
-    const participant = msg.author || null; // for groups
+    const participant = msg.author || null; // for groups (unused here)
     const normalized = normalizeNumber(from);
     const jid = toJid(normalized) || from;
 
-    // ensure chat exists (upsert)
+    // upsert chat
     let chatId = null;
     try {
-      // try to find chat
       const { data: found, error: qerr } = await supabase
         .from("chats")
         .select("id,numero_normalized,status")
@@ -224,9 +232,8 @@ client.on("message", async (msg) => {
       if (qerr) throw qerr;
       if (found && found.length) {
         chatId = found[0].id;
-        // update last_message_at
         const { error: uerr } = await supabase.from("chats").update({ last_message_at: new Date() }).eq("id", chatId);
-        if (uerr) console.warn("Unable to update last_message_at:", uerr.message || uerr);
+        if (uerr) console.warn("[DB] Unable to update last_message_at:", uerr.message || uerr);
       } else {
         const { data: insertData, error: insertErr } = await supabase.from("chats").insert([{
           numero_normalized: normalized,
@@ -240,8 +247,7 @@ client.on("message", async (msg) => {
         chatId = Array.isArray(insertData) ? insertData[0].id : insertData.id;
       }
     } catch (err) {
-      console.warn("Error upserting chat to supabase:", err.message || err);
-      // fallback: enqueue and return
+      console.warn("[MSG] Error upserting chat to supabase:", err.message || err);
       enqueueLocal({ type: "incoming_msg", payload: { from: jid, body: msg.body, id: msg.id?.id }});
       return;
     }
@@ -260,17 +266,17 @@ client.on("message", async (msg) => {
           });
 
           if (uploadErr) {
-            console.warn("Storage upload failed:", uploadErr.message || uploadErr);
-            // fallback: enqueue media for later
+            console.warn("[MEDIA] Storage upload failed:", uploadErr.message || uploadErr);
             enqueueLocal({ type: "media_upload", payload: { filename, buffer: buffer.toString("base64"), contentType: media.mimetype }});
           } else {
             const { data: publicData } = supabase.storage.from(SUPABASE_STORAGE_BUCKET).getPublicUrl(filename);
             media_url = publicData?.publicUrl || null;
+            console.log("[MEDIA] Uploaded media, public URL:", media_url);
           }
         }
       }
     } catch (err) {
-      console.warn("media handling error:", err.message || err);
+      console.warn("[MEDIA] media handling error:", err.message || err);
     }
 
     // insert message record
@@ -284,23 +290,23 @@ client.on("message", async (msg) => {
       whatsapp_message_id: msg.id?.id
     }]);
     if (insertMsgErr) {
-      console.warn("Insert message failed, queue locally:", insertMsgErr.message || insertMsgErr);
+      console.warn("[DB] Insert message failed, queue locally:", insertMsgErr.message || insertMsgErr);
       enqueueLocal({ type: "incoming_msg", payload: { from: jid, body: msg.body, media_url, whatsapp_message_id: msg.id?.id }});
     } else {
       audit("message_received", { chat_id: chatId, whatsapp_id: msg.id?.id });
+      console.log(`[MSG] Stored incoming message ${msg.id?.id} for chat ${chatId}`);
     }
 
   } catch (err) {
-    console.error("Error handling message:", err.message || err);
+    console.error("[MSG] Error handling message:", err.message || err);
   }
 });
 
-// Helper: dispatch approved messages
+// ---- Dispatch loop: invia messaggi approvati
 async function dispatchLoop() {
-  console.log("Dispatch loop started. instance:", INSTANCE_ID);
+  console.log("[WORKER] Dispatch loop started. instance:", INSTANCE_ID);
   while (true) {
     try {
-      // fetch candidate messages approved and not in_progress and attempt_count < 5
       const { data, error } = await supabase
         .from("messages")
         .select("*")
@@ -317,7 +323,7 @@ async function dispatchLoop() {
       }
 
       for (const msg of data) {
-        // try to claim (optimistic)
+        // try to claim message
         const { data: claimed, error: claimErr } = await supabase
           .from("messages")
           .update({ in_progress: true })
@@ -325,7 +331,7 @@ async function dispatchLoop() {
           .select();
 
         if (claimErr) {
-          console.warn("Claim error:", claimErr.message || claimErr);
+          console.warn("[DISPATCH] Claim error:", claimErr.message || claimErr);
           continue;
         }
         if (!claimed || claimed.length === 0) {
@@ -333,16 +339,13 @@ async function dispatchLoop() {
           continue;
         }
 
-        // now send
+        // send
         try {
           if (!clientReady) throw new Error("WhatsApp client not ready");
 
           const jid = (msg.numero) ? toJid(normalizeNumber(msg.numero)) : null;
-          if (!jid && !msg.chat_id) {
-            throw new Error("No destination jid");
-          }
+          if (!jid && !msg.chat_id) throw new Error("No destination jid");
 
-          // If media_url present, download from storage and send as media
           if (msg.media_url) {
             // download file
             const fileRes = await fetch(msg.media_url);
@@ -354,44 +357,44 @@ async function dispatchLoop() {
             const base64 = buffer.toString("base64");
             const media = new MessageMedia(mime, base64);
             const sendRes = await client.sendMessage(jid || msg.chat_id, media, { caption: msg.message || "" });
-            // update DB
             const { error: updErr } = await supabase.from("messages").update({ status: "sent", whatsapp_message_id: sendRes.id?.id || null, in_progress: false }).eq("id", msg.id);
             if (updErr) throw updErr;
             audit("message_sent", { id: msg.id, whatsapp_id: sendRes.id?.id });
+            console.log(`[DISPATCH] Sent media message ${msg.id} -> ${jid || msg.chat_id}`);
           } else {
             const sendRes = await client.sendMessage(jid || msg.chat_id, msg.message || "");
             const { error: updErr } = await supabase.from("messages").update({ status: "sent", whatsapp_message_id: sendRes.id?.id, in_progress: false }).eq("id", msg.id);
             if (updErr) throw updErr;
             audit("message_sent", { id: msg.id, whatsapp_id: sendRes.id?.id });
+            console.log(`[DISPATCH] Sent text message ${msg.id} -> ${jid || msg.chat_id}`);
           }
         } catch (sendErr) {
-          console.error("Send error for message ", msg.id, sendErr.message || sendErr);
-          // increment attempt_count, set in_progress false; maybe set status failed after many attempts
+          console.error("[DISPATCH] Send error for message", msg.id, sendErr.message || sendErr);
           const newAttempts = (msg.attempt_count || 0) + 1;
           const newStatus = (newAttempts >= 5) ? "failed" : "approved";
           const { error: incErr } = await supabase.from("messages").update({ attempt_count: newAttempts, in_progress: false, status: newStatus }).eq("id", msg.id);
-          if (incErr) console.warn("Failed to update attempt_count:", incErr.message || incErr);
+          if (incErr) console.warn("[DB] Failed to update attempt_count:", incErr.message || incErr);
           audit("send_failed", { id: msg.id, error: sendErr.message || sendErr });
         }
       }
 
     } catch (err) {
-      console.error("Dispatch loop error:", err.message || err);
-      // if supabase problem, we'll pause and retry, also persist localQueue marker
+      console.error("[WORKER] Dispatch loop error:", err.message || err);
       enqueueLocal({ type: "dispatch_error", payload: { message: err.message }});
       await sleep(3000);
     }
   }
 }
 
-// periodic worker to flush local queue -> try to sync with supabase
+// ---- Flush local queue worker
 async function flushLocalQueueLoop() {
+  console.log("[WORKER] Flush local queue loop started");
   while (true) {
     if (localQueue.length === 0) {
       await sleep(5000);
       continue;
     }
-    console.log("Flushing local queue:", localQueue.length);
+    console.log("[WORKER] Flushing local queue:", localQueue.length);
     const copy = [...localQueue];
     for (const item of copy) {
       try {
@@ -399,6 +402,7 @@ async function flushLocalQueueLoop() {
           const { actor, action, meta } = item.payload;
           const { error } = await supabase.from("audit_log").insert([{ actor, action, meta }]);
           if (error) throw error;
+          console.log("[FLUSH] audit flushed");
         } else if (item.type === "incoming_msg") {
           const { error } = await supabase.from("messages").insert([{
             chat_id: item.payload.chat_id || null,
@@ -410,42 +414,93 @@ async function flushLocalQueueLoop() {
             whatsapp_message_id: item.payload.whatsapp_message_id || null
           }]);
           if (error) throw error;
+          console.log("[FLUSH] incoming_msg flushed");
         } else if (item.type === "status") {
           const p = item.payload;
           const { error } = await supabase.rpc("set_whatsapp_status", { p_status: p.status || "disconnected", p_client_info: JSON.stringify(p.client_info || {}), p_qr: p.qr || null });
           if (error) throw error;
+          console.log("[FLUSH] status flushed:", p.status);
         } else if (item.type === "media_upload") {
           const filename = item.payload.filename;
           const buffer = Buffer.from(item.payload.buffer, "base64");
           const { error } = await supabase.storage.from(SUPABASE_STORAGE_BUCKET).upload(filename, buffer, { contentType: item.payload.contentType });
           if (error) throw error;
+          console.log("[FLUSH] media_upload flushed:", filename);
         }
-        // if succeeded, remove from localQueue
+        // remove from queue after success
         localQueue = localQueue.filter(x => x !== item);
         persistLocalQueue();
       } catch (err) {
-        console.warn("Error flushing queue item type", item.type, err.message || err);
-        // leave in queue, maybe wait and retry later
+        console.warn("[FLUSH] Error flushing queue item type", item.type, err.message || err);
+        // leave in queue; try again later
       }
     }
     await sleep(2000);
   }
 }
 
-// HTTP endpoints
+// ---- MOCK: login via numero di telefono
+// Nota: whatsapp-web.js non espone una API "login via phone" stabile per ora.
+// Qui simuliamo il comportamento: se riceviamo phone-> settiamo clientReady=true,
+// aggiorniamo lo stato su supabase con `connected_via_phone` e logghiamo audit.
+// Questo ti permette di integrare lato client/dashboard la feature "login via phone"
+// finché non implementi la procedura reale/OTP.
+async function loginViaPhone(phoneNumber) {
+  console.log("\n[AUTH] 📱 Tentativo di accesso via numero di telefono:", phoneNumber);
+  try {
+    // Simulazione delay autenticazione
+    console.log("[AUTH] Simulazione autenticazione... (2s)");
+    await sleep(2000);
+
+    // Mock: consideriamo il login andato a buon fine
+    clientReady = true;
+    console.log("[AUTH] ✅ Accesso via numero completato con successo (mock).");
+
+    // Scriviamo su supabase lo stato
+    try {
+      const { error } = await supabase.rpc("set_whatsapp_status", {
+        p_status: "connected_via_phone",
+        p_client_info: JSON.stringify({ instance: INSTANCE_ID, phoneNumber }),
+        p_qr: null
+      });
+      if (error) throw error;
+      console.log("[DB] set_whatsapp_status -> connected_via_phone");
+    } catch (err) {
+      console.warn("[DB] Failed to update status after phone login:", err.message || err);
+      enqueueLocal({ type: "status", payload: { status: "connected_via_phone", client_info: { phoneNumber } } });
+    }
+
+    audit("login_via_phone_success", { instance: INSTANCE_ID, phoneNumber });
+    return true;
+  } catch (err) {
+    console.error("[AUTH] Errore loginViaPhone:", err.message || err);
+    audit("login_via_phone_failed", { instance: INSTANCE_ID, phoneNumber, err: err.message || err });
+    throw err;
+  }
+}
+
+// ---- HTTP endpoints
+
+// Health
 app.get("/health", (req, res) => {
   res.json({ ok: true, clientReady, instance: INSTANCE_ID });
 });
 
+// Status (reads whatsapp_status table single row)
 app.get("/status", async (req, res) => {
   try {
     const { data } = await supabase.from("whatsapp_status").select("*").limit(1).maybeSingle();
-    res.json({ clientReady, status: data?.status || (clientReady ? "connected" : "disconnected"), whatsapp_status: data || null });
+    res.json({
+      clientReady,
+      status: data?.status || (clientReady ? "connected" : "disconnected"),
+      whatsapp_status: data || null
+    });
   } catch (err) {
     res.json({ clientReady, status: clientReady ? "connected" : "disconnected", error: err.message || err});
   }
 });
 
+// QR legacy endpoint
 app.get("/qr", (req, res) => {
   if (latestQrDataUrl && lastQrAt) {
     res.json({ qr: latestQrDataUrl, qr_generated_at: lastQrAt });
@@ -454,13 +509,48 @@ app.get("/qr", (req, res) => {
   }
 });
 
-// POST /send -> admin (server) endpoint to add an approved message into messages table
-// Expected body: { to: "3933...", message: "test", nome, cognome, chat_id }
-// This endpoint assumes it's called by server/admin system; still we insert as approved so dispatch sends it
+// ---- NEW: /auth endpoint
+// GET /auth -> returns both QR (if exists) and flags about login methods
+// POST /auth { phone } -> attempts login via phone (mock)
+app.get("/auth", (req, res) => {
+  console.log("\n[API] GET /auth - richiesta opzioni auth");
+  const resp = {
+    login_via_phone_available: true, // per tua indicazione il numero è sempre disponibile
+    login_via_qr_available: Boolean(latestQrDataUrl),
+    qr: latestQrDataUrl || null,
+    qr_generated_at: lastQrAt || null
+  };
+  console.log("[API] GET /auth ->", {
+    phone_available: resp.login_via_phone_available,
+    qr_available: resp.login_via_qr_available
+  });
+  res.json(resp);
+});
+
+app.post("/auth", async (req, res) => {
+  const { phone } = req.body;
+  if (!phone) {
+    console.warn("[API] POST /auth senza 'phone' nel body");
+    return res.status(400).json({ error: "Parametro 'phone' mancante" });
+  }
+  console.log(`[API] POST /auth -> richiesta login via phone: ${phone}`);
+  try {
+    await loginViaPhone(phone);
+    res.json({ success: true, message: "Accesso via numero completato (mock)", phone });
+  } catch (err) {
+    console.error("[API] POST /auth errore:", err.message || err);
+    res.status(500).json({ success: false, error: err.message || err });
+  }
+});
+
+// POST /send -> admin endpoint to add an approved message into messages table
 app.post("/send", async (req, res) => {
   const { to, message, nome, cognome, chat_id } = req.body;
   console.log("[API] /send", { to, chat_id, message: message?.slice?.(0,50) });
-  if (!clientReady) return res.status(503).json({ error: "WhatsApp client not ready" });
+  if (!clientReady) {
+    console.warn("[API] /send called but client not ready");
+    return res.status(503).json({ error: "WhatsApp client not ready" });
+  }
   if (!to && !chat_id) return res.status(400).json({ error: "Missing 'to' or 'chat_id' "});
   try {
     const numero = to ? normalizeNumber(to) : null;
@@ -475,8 +565,10 @@ app.post("/send", async (req, res) => {
     }]);
     if (error) throw error;
     const id = Array.isArray(insertData) ? insertData[0].id : insertData.id;
+    console.log("[API] /send -> queued message id:", id);
     res.json({ success: true, message: "Queued for send", id });
   } catch (err) {
+    console.error("[API] /send error:", err.message || err);
     res.status(500).json({ error: err.message || err });
   }
 });
@@ -488,6 +580,7 @@ app.get("/chats", async (req, res) => {
     if (error) throw error;
     res.json(data);
   } catch (err) {
+    console.error("[API] /chats error:", err.message || err);
     res.status(500).json({ error: err.message || err });
   }
 });
@@ -501,18 +594,25 @@ app.get("/messages", async (req, res) => {
     if (error) throw error;
     res.json(data);
   } catch (err) {
+    console.error("[API] /messages error:", err.message || err);
     res.status(500).json({ error: err.message || err });
   }
 });
 
-// Start server and workers
+// ---- Start server and workers
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Server listening on ${PORT}`);
+  console.log(`\n🚀 Server listening on port ${PORT}`);
+  console.log(`Instance ID: ${INSTANCE_ID}`);
+  console.log("------------------------------------------------\n");
+
   audit("server_started", { port: PORT, instance: INSTANCE_ID });
+
   // initialize workers
-  dispatchLoop().catch(e => console.error("dispatchLoop crashed:", e));
-  flushLocalQueueLoop().catch(e => console.error("flushLocalQueue crashed:", e));
+  dispatchLoop().catch(e => console.error("[WORKER] dispatchLoop crashed:", e));
+  flushLocalQueueLoop().catch(e => console.error("[WORKER] flushLocalQueue crashed:", e));
 });
 
+// ---- Initialize WhatsApp client
+console.log("[STARTUP] Inizializzo client WhatsApp...");
 client.initialize();
